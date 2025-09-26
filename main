@@ -1,0 +1,247 @@
+"""
+Module: xrp_hybrid_claim
+Purpose: Automate XRP faucet claims from faucetearner.org with hybrid force strategy: Random 1-10s delay between attempts, but enforce 60s static cooldown after success to align with server cycle. Handles manual login, claims, parsing, and logging based on HAR/log analysis. WARNING: Use at own risk; respect site terms to avoid ban.
+Author: AI-Generated
+Date: 2025-09-26
+Dependencies: aiohttp==3.9.5, tenacity==8.5.0, logging==0.4.9.6
+"""
+
+import logging
+import asyncio
+import json
+import re
+import random
+import atexit
+from typing import Dict, Optional, Any
+from dataclasses import dataclass
+from enum import Enum
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# Configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Constants
+API_BASE_URL = "https://faucetearner.org/api.php"  # HTTPS from analysis
+CLAIMS_LOG_FILE = "claims.log"
+MAX_RETRIES = 5
+TIMEOUT = 30
+FORCE_DELAY = (1, 10)  # Random delay seconds between attempts
+SUCCESS_COOLDOWN = 60  # Static cooldown after success
+BUFFER_TIME = 2  # Extra buffer
+
+# Custom Exceptions
+class APIException(Exception):
+    """Base exception for API related errors"""
+    pass
+
+class AuthException(APIException):
+    """Exception for authentication failures"""
+    pass
+
+class CooldownException(APIException):
+    """Exception for claim cooldown"""
+    pass
+
+@dataclass
+class Config:
+    """Configuration dataclass"""
+    email: str
+    password: str
+    base_url: str = API_BASE_URL
+    headers: Dict[str, str] = None
+    timeout: int = TIMEOUT
+    max_retries: int = MAX_RETRIES
+
+    def __post_init__(self):
+        if self.headers is None:
+            self.headers = {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 12; Infinix X669C Build/SP1A.210812.016) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.155 Mobile Safari/537.36",
+                "Content-Type": "application/json",
+                "Accept": "*/*",
+                "Origin": "https://faucetearner.org",
+                "X-Requested-With": "mark.via.gp",
+                "Referer": "https://faucetearner.org/faucet.php",
+                "Accept-Encoding": "gzip, deflate",
+                "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"
+            }
+
+class Action(Enum):
+    """API actions from HAR analysis"""
+    LOGIN = "login"
+    FAUCET = "faucet"
+
+class SessionManager:
+    """Manages cookies and session state"""
+    
+    def __init__(self):
+        self.cookies: Dict[str, str] = {"reg": "1"}
+        self.user_id: Optional[str] = None
+        
+    def update_cookies(self, response_headers: Dict) -> None:
+        """Update cookies from Set-Cookie headers"""
+        set_cookie_header = response_headers.get("Set-Cookie", "")
+        if set_cookie_header:
+            for cookie in set_cookie_header.split(", "):
+                if "=" in cookie:
+                    key, value = cookie.split("=", 1)
+                    self.cookies[key.strip()] = value.strip().split(";")[0]
+        
+    def get_cookie_header(self) -> str:
+        """Generate Cookie header string"""
+        return "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+
+class RewardParser:
+    """Parses reward amount from claim response message"""
+    
+    @staticmethod
+    def extract_xrp_amount(message: str) -> Optional[float]:
+        """Extract XRP amount using regex from HTML-formatted message"""
+        match = re.search(r'(\d+\.\d+) XRP', message)
+        if match:
+            return float(match.group(1))
+        return None
+
+class APIClient:
+    """Async API Client with production features"""
+    
+    def __init__(self, config: Config, session_manager: SessionManager):
+        self.config = config
+        self.session_manager = session_manager
+        self.session: Optional[aiohttp.ClientSession] = None
+        
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(
+            headers=self.config.headers,
+            timeout=aiohttp.ClientTimeout(total=self.config.timeout),
+            cookie_jar=aiohttp.CookieJar(unsafe=True)
+        )
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    @retry(retry=retry_if_exception_type(APIException),
+           stop=stop_after_attempt(MAX_RETRIES),
+           wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def _make_request(self, url: str, payload: Optional[Dict] = None) -> Dict:
+        """Core request method with retry"""
+        if not self.session:
+            raise APIException("Session not initialized")
+            
+        data = json.dumps(payload or {})
+        headers = self.config.headers.copy()
+        headers["Cookie"] = self.session_manager.get_cookie_header()
+        headers["Content-Length"] = str(len(data))
+        
+        try:
+            async with self.session.post(url, data=data, headers=headers) as response:
+                response.raise_for_status()
+                self.session_manager.update_cookies(dict(response.headers))
+                content = await response.json()
+                
+                if not isinstance(content, dict) or "code" not in content:
+                    raise APIException("Invalid JSON response structure")
+                if content.get("code") in [1, 401]:
+                    raise AuthException("Session expired")
+                return content
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error: {str(e)}")
+            raise APIException(f"Network error: {str(e)}")
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {str(e)}")
+            raise APIException("Invalid JSON response")
+    
+    async def login(self) -> Dict:
+        """Perform login and update session"""
+        url = f"{self.config.base_url}?act={Action.LOGIN.value}"
+        payload = {"email": self.config.email, "password": self.config.password}
+        response = await self._make_request(url, payload)
+        if response.get("code") != 0:
+            raise AuthException(response.get("message", "Login failed"))
+        self.session_manager.user_id = self.session_manager.cookies.get("user")
+        logger.info("Login successful")
+        return response
+    
+    async def hybrid_claim(self) -> Dict:
+        """Hybrid claim attempt"""
+        url = f"{self.config.base_url}?act={Action.FAUCET.value}"
+        response = await self._make_request(url)
+        if response.get("code") == 2:
+            raise CooldownException(response.get("message", "Cooldown active"))
+        elif response.get("code") != 0:
+            raise APIException(response.get("message", "Claim failed"))
+        logger.info(f"Hybrid claim successful: {response.get('message', 'XRP claimed!')}")
+        return response
+
+class FlowController:
+    """Orchestrates the hybrid claim flow"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.session_manager = SessionManager()
+        self.client: Optional[APIClient] = None
+        self.reward_parser = RewardParser()
+        atexit.register(self._save_state)
+    
+    def _save_state(self):
+        """Save claim state on exit"""
+        logger.info("Shutting down; claims saved to claims.log")
+    
+    def _log_claim(self, response: Dict, amount: Optional[float], success: bool) -> None:
+        """Log claim details to file"""
+        log_entry = {
+            "timestamp": asyncio.get_event_loop().time(),
+            "response": response,
+            "amount_xrp": amount,
+            "success": success
+        }
+        with open(CLAIMS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+    
+    async def run(self):
+        """Main execution loop with hybrid strategy"""
+        async with APIClient(self.config, self.session_manager) as client:
+            self.client = client
+            await client.login()
+            
+            while True:
+                try:
+                    # Random delay for force attempt
+                    delay = random.randint(FORCE_DELAY[0], FORCE_DELAY[1])
+                    logger.info(f"Waiting random delay: {delay} seconds before next attempt")
+                    await asyncio.sleep(delay)
+                    
+                    # Attempt claim
+                    claim_response = await self.client.hybrid_claim()
+                    amount = self.reward_parser.extract_xrp_amount(claim_response.get("message", ""))
+                    self._log_claim(claim_response, amount, True)
+                    logger.info(f"Claimed: {amount or 'Unknown'} XRP")
+                    
+                    # Enforce static cooldown after success
+                    cooldown = SUCCESS_COOLDOWN + BUFFER_TIME
+                    logger.info(f"Success: Enforcing static cooldown of {cooldown} seconds")
+                    await asyncio.sleep(cooldown)
+                except CooldownException as e:
+                    logger.warning(f"Rejected (cooldown): {str(e)}")
+                    self._log_claim({"message": str(e)}, None, False)
+                    # Continue with next random delay, no extra sleep
+                except AuthException:
+                    logger.warning("Auth expired, re-logging in...")
+                    await self.client.login()
+                except Exception as e:
+                    logger.error(f"Unexpected error: {str(e)}")
+                    await asyncio.sleep(60)  # Backoff
+
+# Usage with manual input
+async def main():
+    email = input("email: ")
+    password = input("password: ")
+    config = Config(email=email, password=password)
+    controller = FlowController(config)
+    await controller.run()
+
+if __name__ == "__main__":
+    asyncio.run(main())
